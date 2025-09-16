@@ -8780,6 +8780,22 @@ static Sys_var_bool Sys_partition_table_skip_limit(
     "The partion key doesn't need to be part of all unique index if setting to true",
     GLOBAL_VAR(opt_par_skip_limit),  CMD_LINE(OPT_ARG),DEFAULT(false));
 
+#ifndef _WIN32
+static bool update_commit_node_num(sys_var *self, THD *thd, enum_var_type type) {
+  Commit_stage_manager::get_instance().update_affinity_cpuset();
+  return false;
+}
+
+static Sys_var_long Sys_commit_node_num(
+    "commit_node_num",
+    "The number of numa nodes that is used for setting affinity of the header thread "
+    "who is executing group commit. Default 0, means no affinity.",
+    GLOBAL_VAR(commit_node_num),  CMD_LINE(OPT_ARG),
+    VALID_RANGE(0, LONG_MAX), DEFAULT(0), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(nullptr), ON_UPDATE(update_commit_node_num),
+    nullptr, sys_var::PARSE_EARLY);
+#endif
+
 #if defined(HAVE_OPT_CTX)
 static bool fix_optimizer_context_max_mem_size(sys_var *, THD *thd,
                                                enum_var_type type) {

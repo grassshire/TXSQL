@@ -129,6 +129,10 @@ void Commit_stage_manager::init(PSI_mutex_key key_LOCK_flush_queue,
   m_queue[SYNC_STAGE].init(&m_queue_lock[SYNC_STAGE]);
   m_queue[COMMIT_STAGE].init(&m_queue_lock[COMMIT_STAGE]);
   m_queue[COMMIT_ORDER_FLUSH_STAGE].init(&m_queue_lock[BINLOG_FLUSH_STAGE]);
+
+#ifndef _WIN32
+  m_numa_affinity_mngr.init();
+#endif
 }
 
 void Commit_stage_manager::deinit() {
@@ -221,7 +225,12 @@ bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
     The stage mutex can be nullptr if we are enrolling for the first
     stage.
   */
-  if (stage_mutex && need_unlock_stage_mutex) mysql_mutex_unlock(stage_mutex);
+  if (stage_mutex && need_unlock_stage_mutex) {
+    mysql_mutex_unlock(stage_mutex);
+#ifndef _WIN32
+    m_numa_affinity_mngr.unset_numa_affinity();
+#endif
+  }
 
 #ifndef NDEBUG
   DBUG_PRINT("info", ("This is a leader thread: %d (0=n 1=y)", leader));
@@ -297,6 +306,9 @@ bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
     need_lock_enter_mutex = !(mysql_bin_log.is_rotating_caused_by_incident &&
                               enter_mutex == mysql_bin_log.get_log_lock());
 
+#ifndef _WIN32
+    m_numa_affinity_mngr.set_numa_affinity();
+#endif
     if (need_lock_enter_mutex)
       mysql_mutex_lock(enter_mutex);
     else

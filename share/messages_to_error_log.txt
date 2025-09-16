@@ -12040,6 +12040,24 @@ ER_READ_TIME_AND_GTS_FROM_PREV
 ER_COLUMN_COMPRESSION_GENERAL_ERROR
   eng "Column Compression: %s"
 
+ER_NUMA_AWARE
+  eng "%s"
+
+ER_NUMA_NODE_NUM_OVERFLOW
+  eng "Number of numa nodes to configure is larger than the number of nodes that can be used. To configure: %d, Can be used: %d."
+
+ER_FIND_NUMA_NODE
+  eng "There is no node in /sys/devices/system/node."
+
+ER_SET_AFFINITY
+  eng "Fail to set affinity for thread: %d."
+
+ER_UNSET_AFFINITY
+  eng "Fail to unset affinity for thread: %d."
+
+ER_UPDATE_AFFINITY
+  eng "Fail to update affinity for commit thread. Check if binlog is enabled."
+
 #
 # Start of server-to-error-log message for parallel execution.
 #

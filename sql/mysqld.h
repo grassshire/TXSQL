@@ -277,6 +277,9 @@ extern bool opt_using_transactions;
 extern ulong current_pid;
 extern ulong expire_logs_days;
 extern ulong binlog_expire_logs_seconds;
+#ifndef _WIN32
+extern ulong commit_node_num;
+#endif
 extern bool opt_binlog_expire_logs_auto_purge;
 extern uint sync_binlog_period, sync_relaylog_period, sync_relayloginfo_period,
     sync_masterinfo_period, opt_mta_checkpoint_period, opt_mta_checkpoint_group;
@@ -607,6 +610,10 @@ extern PSI_file_key key_file_relaylog_index;
 extern PSI_file_key key_file_relaylog_index_cache;
 extern PSI_file_key key_file_sdi;
 extern PSI_file_key key_file_hash_join;
+#ifndef _WIN32
+extern PSI_file_key key_file_nodes_cpulist;
+extern PSI_file_key key_file_nodes_distance;
+#endif
 
 extern PSI_socket_key key_socket_tcpip;
 extern PSI_socket_key key_socket_unix;

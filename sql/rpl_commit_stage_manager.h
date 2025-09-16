@@ -27,12 +27,86 @@
 #include <utility>
 
 #include "my_dbug.h"
+#include "mysql/components/services/log_builtins.h"
 #include "mysql/psi/mysql_cond.h"
 #include "mysql/psi/mysql_mutex.h"
 #include "sql/sql_class.h"
 #include "thr_mutex.h"
+#ifndef _WIN32
+#include "sql/numa_affinity.h"
+class commit_numa_affinity;
+#endif
 
 class THD;
+
+#ifndef _WIN32
+/* Used to set numa affinity for the thread who is executing the group commit. */
+class commit_numa_affinity : public numa_affinity {
+public:
+  commit_numa_affinity() {
+    CPU_ZERO(&m_affinity_cpuset);
+  }
+  ~commit_numa_affinity() {}
+
+  void init(void) {
+    if (is_numa_inited()) {
+      m_enabled = commit_node_num > 0 ? true : false;
+      if (m_enabled) {
+        update_affinity_cpuset();
+      } else {
+        LogErr(WARNING_LEVEL, ER_NUMA_AWARE, "Numa affinity for doing commit is disabled for number of nodes configured is zero.");
+      }
+    } else {
+      LogErr(WARNING_LEVEL, ER_NUMA_AWARE, "Numa affinity for doing commit is disabled for system numa nodes info not inited successfully.");
+    }
+  }
+
+  /**
+    Check if we can set numa affinity.
+  */
+  bool is_enabled(void) {
+    return m_enabled;
+  }
+
+  /**
+    Update the numa affinity setting of commit threads. The caller should confirm that m_enabled is set.
+  */
+  void update_affinity_cpuset(void) {
+    get_numa_infos()->update_affinity_cpuset(commit_node_num, &m_affinity_cpuset);
+  }
+
+  /**
+    Call this when would like to set numa affinity on the fly.
+  */
+  void reinit(void) {
+    init();
+  }
+
+  /**
+    Set numa affinity for the caller.
+  */
+  void set_numa_affinity(void) {
+    if (m_enabled) {
+      get_numa_infos()->set_numa_affinity(&m_affinity_cpuset);
+    }
+  }
+
+  /**
+    Unset numa affinity of the caller.
+  */
+  void unset_numa_affinity(void) {
+    if (m_enabled) {
+      get_numa_infos()->unset_numa_affinity();
+    }
+  }
+
+private:
+  bool m_enabled = false;
+
+  /** CPU list for setting affinity of the header thread. */
+  cpu_set_t m_affinity_cpuset;
+};
+#endif
 
 /**
   Class for maintaining the commit stages for binary log group commit.
@@ -331,6 +405,15 @@ class Commit_stage_manager {
   */
   void unlock_queue(StageID stage) { m_queue[stage].unlock(); }
 
+#ifndef _WIN32
+  /**
+    Update the NUMA node affinity for threads doing commit.
+  */
+  void update_affinity_cpuset(void) {
+    m_numa_affinity_mngr.reinit();
+  }
+#endif
+
  private:
   /** check if Commit_stage_manager variables already initialized. */
   bool m_is_initialized;
@@ -387,6 +470,11 @@ class Commit_stage_manager {
 
   /** Condition variable to indicate a follower started waiting for commit */
   mysql_cond_t m_cond_preempt;
+#endif
+
+#ifndef _WIN32
+  /** Manage numa node resource and provide interfaces for binding/unbinding/updating resource. */
+  commit_numa_affinity m_numa_affinity_mngr;
 #endif
 };
 

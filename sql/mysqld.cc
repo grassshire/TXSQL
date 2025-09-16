@@ -1474,6 +1474,9 @@ uint sync_binlog_period = 0, sync_relaylog_period = 0,
 ulong expire_logs_days = 0;
 ulong binlog_expire_logs_seconds = 0;
 bool opt_binlog_expire_logs_auto_purge{true};
+#ifndef _WIN32
+ulong commit_node_num = 0;
+#endif
 /**
   Soft upper limit for number of sp_head objects that can be stored
   in the sp_cache for one connection.
@@ -7768,6 +7771,8 @@ int mysqld_main(int argc, char **argv)
     flush_error_log_messages();
     return 1;
   }
+
+  m_server_numa_infos.init();
 #endif /* _WIN32 */
 
   orig_argc = argc;
@@ -12837,6 +12842,10 @@ PSI_file_key key_file_relaylog_index;
 PSI_file_key key_file_relaylog_index_cache;
 PSI_file_key key_file_sdi;
 PSI_file_key key_file_hash_join;
+#ifndef _WIN32
+PSI_file_key key_file_nodes_cpulist;
+PSI_file_key key_file_nodes_distance;
+#endif
 
 /* clang-format off */
 static PSI_file_info all_server_files[]=
@@ -12869,7 +12878,11 @@ static PSI_file_info all_server_files[]=
   { &key_file_trn, "trigger", 0, 0, PSI_DOCUMENT_ME},
   { &key_file_init, "init", 0, 0, PSI_DOCUMENT_ME},
   { &key_file_sdi, "SDI", 0, 0, PSI_DOCUMENT_ME},
-  { &key_file_hash_join, "hash_join", 0, 0, PSI_DOCUMENT_ME}
+  { &key_file_hash_join, "hash_join", 0, 0, PSI_DOCUMENT_ME},
+#ifndef _WIN32
+  { &key_file_nodes_cpulist, "nodes_cpulist", 0, 0,  PSI_DOCUMENT_ME},
+  { &key_file_nodes_distance, "nodes_distance", 0, 0, PSI_DOCUMENT_ME}
+#endif
 };
 /* clang-format on */
 #endif /* HAVE_PSI_INTERFACE */

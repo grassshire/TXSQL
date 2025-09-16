@@ -797,6 +797,11 @@ ENDIF()
 
 IF(LINUX)
   LIST(APPEND SQL_SHARED_SOURCES
+    numa_affinity.cc)
+ENDIF()
+
+IF(LINUX)
+  LIST(APPEND SQL_SHARED_SOURCES
     resourcegroups/platform/thread_attrs_api_linux.cc)
 ELSEIF(APPLE)
   LIST(APPEND SQL_SHARED_SOURCES
