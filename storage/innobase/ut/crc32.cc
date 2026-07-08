@@ -90,6 +90,7 @@ other files in library. The code in this file is used to make a library for
 external tools. */
 
 #include <string.h>
+#include <cstdlib>
 #include "my_compiler.h"
 #include "my_config.h"
 #include "my_inttypes.h"
@@ -803,6 +804,313 @@ uint32_t crc32_using_unrolled_loop_poly_mul(const byte *data, size_t len) {
   return crc32<use_unrolled_loop_poly_mul>(0, data, len);
 }
 
+/* ===========================================================================
+ * CRC-32C PCLMUL folding backend (zlib-style, Castagnoli polynomial).
+ *
+ * Port of the PCLMULQDQ folding technique from zlib's crc32_x86.h, but with
+ * CRC-32C (Castagnoli, 0x1EDC6F41) constants so it is a drop-in backend for
+ * ut_crc32 (which MUST compute CRC-32C, not zlib's standard CRC-32).
+ *
+ * On CPUs where the SSE4.2 CRC32 instruction is throughput-bound rather than
+ * latency-bound (e.g. Hygon C86 / AMD Zen), the 3-slice CRC32-instruction
+ * approach above gains nothing from its parallel slices, and pure-PCLMUL
+ * folding is substantially faster.  This backend is selected at init time via
+ * the UT_CRC32_USE_FOLD environment variable, and self-checks against the
+ * software reference before being installed.
+ *
+ * Constants follow the recipe: constant = flip_at_32(x^k mod 0x11EDC6F41),
+ * matching the existing compute_x_to_8len()+flip_at_32() machinery, with
+ * rk7 = flip_at_32(floor(x^64 / 0x11EDC6F41)) for the Barrett reduction. */
+#if defined(CRC32_x86_64_DEFAULT)
+
+#define CRC32C_FOLD4_LO 0x9e4addf8U /* flip_at_32(x^480 mod P) */
+#define CRC32C_FOLD4_HI 0x740eef02U /* flip_at_32(x^544 mod P) */
+
+__attribute__((aligned(32))) static const unsigned crc32c_pshufb_shf_table[60] = {
+    0x84838281, 0x88878685, 0x8c8b8a89, 0x008f8e8d, 0x85848382, 0x89888786,
+    0x8d8c8b8a, 0x01008f8e, 0x86858483, 0x8a898887, 0x8e8d8c8b, 0x0201008f,
+    0x87868584, 0x8b8a8988, 0x8f8e8d8c, 0x03020100, 0x88878685, 0x8c8b8a89,
+    0x008f8e8d, 0x04030201, 0x89888786, 0x8d8c8b8a, 0x01008f8e, 0x05040302,
+    0x8a898887, 0x8e8d8c8b, 0x0201008f, 0x06050403, 0x8b8a8988, 0x8f8e8d8c,
+    0x03020100, 0x07060504, 0x8c8b8a89, 0x008f8e8d, 0x04030201, 0x08070605,
+    0x8d8c8b8a, 0x01008f8e, 0x05040302, 0x09080706, 0x8e8d8c8b, 0x0201008f,
+    0x06050403, 0x0a090807, 0x8f8e8d8c, 0x03020100, 0x07060504, 0x0b0a0908,
+    0x008f8e8d, 0x04030201, 0x08070605, 0x0c0b0a09, 0x01008f8e, 0x05040302,
+    0x09080706, 0x0d0c0b0a, 0x0201008f, 0x06050403, 0x0a090807, 0x0e0d0c0b};
+/* rk1,rk2 | rk5,rk6 | rk7,rk8 -- each pair a 128-bit constant (low/high u32) */
+__attribute__((aligned(16))) static const unsigned crc32c_crc_k[] = {
+    0x4cd00bd6, 0x00000001, 0xf20c0dfe, 0x00000000, /* rk1=flip(x^96)  rk2=flip(x^160) */
+    0x4cd00bd6, 0x00000001, 0xdd45aab8, 0x00000000, /* rk5=rk1          rk6=flip(x^64)  */
+    0xdea713f0, 0x00000000, 0x05ec76f0, 0x00000001};/* rk7=flip(x^64/P) rk8=flip(x^32)  */
+__attribute__((aligned(16))) static const unsigned crc32c_crc_mask[4] = {
+    0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0x00000000};
+__attribute__((aligned(16))) static const unsigned crc32c_crc_mask2[4] = {
+    0x00000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
+
+MY_ATTRIBUTE((target("sse4.2,pclmul")))
+static inline __m128i crc32c_fold4_const() {
+  return _mm_set_epi32(0, CRC32C_FOLD4_HI, 0, CRC32C_FOLD4_LO);
+}
+
+MY_ATTRIBUTE((target("sse4.2,pclmul")))
+static void crc32c_fold_1(__m128i *c0, __m128i *c1, __m128i *c2, __m128i *c3) {
+  const __m128i f = crc32c_fold4_const();
+  __m128i t3 = *c3;
+  *c3 = *c0;
+  *c0 = _mm_clmulepi64_si128(*c0, f, 0x01);
+  *c3 = _mm_clmulepi64_si128(*c3, f, 0x10);
+  __m128 r = _mm_xor_ps(_mm_castsi128_ps(*c0), _mm_castsi128_ps(*c3));
+  *c0 = *c1;
+  *c1 = *c2;
+  *c2 = t3;
+  *c3 = _mm_castps_si128(r);
+}
+
+MY_ATTRIBUTE((target("sse4.2,pclmul")))
+static void crc32c_fold_2(__m128i *c0, __m128i *c1, __m128i *c2, __m128i *c3) {
+  const __m128i f = crc32c_fold4_const();
+  __m128i t3 = *c3, t2 = *c2;
+  *c3 = *c1;
+  *c1 = _mm_clmulepi64_si128(*c1, f, 0x01);
+  *c3 = _mm_clmulepi64_si128(*c3, f, 0x10);
+  __m128 r31 = _mm_xor_ps(_mm_castsi128_ps(*c3), _mm_castsi128_ps(*c1));
+  *c2 = *c0;
+  *c0 = _mm_clmulepi64_si128(*c0, f, 0x01);
+  *c2 = _mm_clmulepi64_si128(*c2, f, 0x10);
+  __m128 r20 = _mm_xor_ps(_mm_castsi128_ps(*c0), _mm_castsi128_ps(*c2));
+  *c0 = t2;
+  *c1 = t3;
+  *c2 = _mm_castps_si128(r20);
+  *c3 = _mm_castps_si128(r31);
+}
+
+MY_ATTRIBUTE((target("sse4.2,pclmul")))
+static void crc32c_fold_3(__m128i *c0, __m128i *c1, __m128i *c2, __m128i *c3) {
+  const __m128i f = crc32c_fold4_const();
+  __m128i t3 = *c3;
+  *c3 = *c2;
+  *c2 = _mm_clmulepi64_si128(*c2, f, 0x01);
+  *c3 = _mm_clmulepi64_si128(*c3, f, 0x10);
+  __m128 r32 = _mm_xor_ps(_mm_castsi128_ps(*c2), _mm_castsi128_ps(*c3));
+  *c2 = *c1;
+  *c1 = _mm_clmulepi64_si128(*c1, f, 0x01);
+  *c2 = _mm_clmulepi64_si128(*c2, f, 0x10);
+  __m128 r21 = _mm_xor_ps(_mm_castsi128_ps(*c1), _mm_castsi128_ps(*c2));
+  *c1 = *c0;
+  *c0 = _mm_clmulepi64_si128(*c0, f, 0x01);
+  *c1 = _mm_clmulepi64_si128(*c1, f, 0x10);
+  __m128 r10 = _mm_xor_ps(_mm_castsi128_ps(*c0), _mm_castsi128_ps(*c1));
+  *c0 = t3;
+  *c1 = _mm_castps_si128(r10);
+  *c2 = _mm_castps_si128(r21);
+  *c3 = _mm_castps_si128(r32);
+}
+
+MY_ATTRIBUTE((target("sse4.2,pclmul")))
+static void crc32c_fold_4(__m128i *c0, __m128i *c1, __m128i *c2, __m128i *c3) {
+  const __m128i f = crc32c_fold4_const();
+  __m128i t0 = *c0, t1 = *c1, t2 = *c2, t3 = *c3;
+  *c0 = _mm_clmulepi64_si128(*c0, f, 0x01);
+  t0 = _mm_clmulepi64_si128(t0, f, 0x10);
+  *c0 = _mm_castps_si128(
+      _mm_xor_ps(_mm_castsi128_ps(*c0), _mm_castsi128_ps(t0)));
+  *c1 = _mm_clmulepi64_si128(*c1, f, 0x01);
+  t1 = _mm_clmulepi64_si128(t1, f, 0x10);
+  *c1 = _mm_castps_si128(
+      _mm_xor_ps(_mm_castsi128_ps(*c1), _mm_castsi128_ps(t1)));
+  *c2 = _mm_clmulepi64_si128(*c2, f, 0x01);
+  t2 = _mm_clmulepi64_si128(t2, f, 0x10);
+  *c2 = _mm_castps_si128(
+      _mm_xor_ps(_mm_castsi128_ps(*c2), _mm_castsi128_ps(t2)));
+  *c3 = _mm_clmulepi64_si128(*c3, f, 0x01);
+  t3 = _mm_clmulepi64_si128(t3, f, 0x10);
+  *c3 = _mm_castps_si128(
+      _mm_xor_ps(_mm_castsi128_ps(*c3), _mm_castsi128_ps(t3)));
+}
+
+MY_ATTRIBUTE((target("sse4.2,pclmul")))
+static void crc32c_partial_fold(size_t len, __m128i *c0, __m128i *c1,
+                                __m128i *c2, __m128i *c3, __m128i *part) {
+  const __m128i f = crc32c_fold4_const();
+  const __m128i mask3 = _mm_set1_epi32((int32_t)0x80808080);
+  __m128i shl = _mm_load_si128(
+      reinterpret_cast<const __m128i *>(crc32c_pshufb_shf_table + (4 * (len - 1))));
+  __m128i shr = _mm_xor_si128(shl, mask3);
+  __m128i a0_0 = _mm_shuffle_epi8(*c0, shl);
+  *c0 = _mm_shuffle_epi8(*c0, shr);
+  __m128i tmp1 = _mm_shuffle_epi8(*c1, shl);
+  *c0 = _mm_or_si128(*c0, tmp1);
+  *c1 = _mm_shuffle_epi8(*c1, shr);
+  __m128i tmp2 = _mm_shuffle_epi8(*c2, shl);
+  *c1 = _mm_or_si128(*c1, tmp2);
+  *c2 = _mm_shuffle_epi8(*c2, shr);
+  __m128i tmp3 = _mm_shuffle_epi8(*c3, shl);
+  *c2 = _mm_or_si128(*c2, tmp3);
+  *c3 = _mm_shuffle_epi8(*c3, shr);
+  *part = _mm_shuffle_epi8(*part, shl);
+  *c3 = _mm_or_si128(*c3, *part);
+  __m128i a0_1 = _mm_clmulepi64_si128(a0_0, f, 0x10);
+  a0_0 = _mm_clmulepi64_si128(a0_0, f, 0x01);
+  __m128 r = _mm_xor_ps(_mm_xor_ps(_mm_castsi128_ps(*c3), _mm_castsi128_ps(a0_0)),
+                        _mm_castsi128_ps(a0_1));
+  *c3 = _mm_castps_si128(r);
+}
+
+/* Reduce the 4 lanes down to a 32-bit value (no final ~). */
+MY_ATTRIBUTE((target("sse4.2,pclmul")))
+static inline uint32_t crc32c_final_raw(__m128i c0, __m128i c1, __m128i c2,
+                                        __m128i c3) {
+  const __m128i mask =
+      _mm_load_si128(reinterpret_cast<const __m128i *>(crc32c_crc_mask));
+  const __m128i mask2 =
+      _mm_load_si128(reinterpret_cast<const __m128i *>(crc32c_crc_mask2));
+  __m128i t0, t1, t2, cf;
+  cf = _mm_load_si128(reinterpret_cast<const __m128i *>(crc32c_crc_k));
+  t0 = _mm_clmulepi64_si128(c0, cf, 0x10);
+  c0 = _mm_clmulepi64_si128(c0, cf, 0x01);
+  c1 = _mm_xor_si128(_mm_xor_si128(c1, t0), c0);
+  t1 = _mm_clmulepi64_si128(c1, cf, 0x10);
+  c1 = _mm_clmulepi64_si128(c1, cf, 0x01);
+  c2 = _mm_xor_si128(_mm_xor_si128(c2, t1), c1);
+  t2 = _mm_clmulepi64_si128(c2, cf, 0x10);
+  c2 = _mm_clmulepi64_si128(c2, cf, 0x01);
+  c3 = _mm_xor_si128(_mm_xor_si128(c3, t2), c2);
+  cf = _mm_load_si128(reinterpret_cast<const __m128i *>(crc32c_crc_k + 4));
+  c0 = c3;
+  c3 = _mm_clmulepi64_si128(c3, cf, 0);
+  c0 = _mm_srli_si128(c0, 8);
+  c3 = _mm_xor_si128(c3, c0);
+  c0 = c3;
+  c3 = _mm_slli_si128(c3, 4);
+  c3 = _mm_clmulepi64_si128(c3, cf, 0x10);
+  c3 = _mm_xor_si128(c3, c0);
+  c3 = _mm_and_si128(c3, mask2);
+  cf = _mm_load_si128(reinterpret_cast<const __m128i *>(crc32c_crc_k + 8));
+  c1 = c3;
+  c2 = c3;
+  c3 = _mm_clmulepi64_si128(c3, cf, 0);
+  c3 = _mm_xor_si128(c3, c2);
+  c3 = _mm_and_si128(c3, mask);
+  c2 = c3;
+  c3 = _mm_clmulepi64_si128(c3, cf, 0x10);
+  c3 = _mm_xor_si128(_mm_xor_si128(c3, c2), c1);
+  return (uint32_t)_mm_extract_epi32(c3, 2);
+}
+
+/* Fold 'len' (>=16) bytes into the 4-lane state.  init_xor is XORed into the
+ * low 32 bits of the first 16-byte load (handles the standard 0xFFFFFFFF init
+ * without zlib's magic reset constant). */
+MY_ATTRIBUTE((target("sse4.2,pclmul")))
+static void crc32c_fold_body(const byte *src, size_t len, uint32_t init_xor,
+                             __m128i *c0, __m128i *c1, __m128i *c2,
+                             __m128i *c3) {
+  __m128i t0, t1, t2, t3, part = _mm_setzero_si128();
+  __m128i ini = _mm_cvtsi32_si128((int)init_xor);
+  int inited = 0;
+  /* Caller (crc32c_using_fold) guarantees len >= 16. */
+  size_t algn = ((uintptr_t)16 - ((uintptr_t)src & 0xF)) & 0xF;
+  if (algn) {
+    part = _mm_loadu_si128(reinterpret_cast<const __m128i *>(src));
+    part = _mm_xor_si128(part, ini);
+    inited = 1;
+    crc32c_partial_fold(algn, c0, c1, c2, c3, &part);
+    src += algn;
+    len -= algn;
+  }
+  while (len >= 64) {
+    len -= 64;
+    t0 = _mm_load_si128(reinterpret_cast<const __m128i *>(src));
+    t1 = _mm_load_si128(reinterpret_cast<const __m128i *>(src) + 1);
+    t2 = _mm_load_si128(reinterpret_cast<const __m128i *>(src) + 2);
+    t3 = _mm_load_si128(reinterpret_cast<const __m128i *>(src) + 3);
+    src += 64;
+    crc32c_fold_4(c0, c1, c2, c3);
+    if (!inited) {
+      t0 = _mm_xor_si128(t0, ini);
+      inited = 1;
+    }
+    *c0 = _mm_xor_si128(*c0, t0);
+    *c1 = _mm_xor_si128(*c1, t1);
+    *c2 = _mm_xor_si128(*c2, t2);
+    *c3 = _mm_xor_si128(*c3, t3);
+  }
+  if (len >= 48) {
+    len -= 48;
+    t0 = _mm_load_si128(reinterpret_cast<const __m128i *>(src));
+    t1 = _mm_load_si128(reinterpret_cast<const __m128i *>(src) + 1);
+    t2 = _mm_load_si128(reinterpret_cast<const __m128i *>(src) + 2);
+    src += 48;
+    crc32c_fold_3(c0, c1, c2, c3);
+    if (!inited) {
+      t0 = _mm_xor_si128(t0, ini);
+      inited = 1;
+    }
+    *c1 = _mm_xor_si128(*c1, t0);
+    *c2 = _mm_xor_si128(*c2, t1);
+    *c3 = _mm_xor_si128(*c3, t2);
+  } else if (len >= 32) {
+    len -= 32;
+    t0 = _mm_load_si128(reinterpret_cast<const __m128i *>(src));
+    t1 = _mm_load_si128(reinterpret_cast<const __m128i *>(src) + 1);
+    src += 32;
+    crc32c_fold_2(c0, c1, c2, c3);
+    if (!inited) {
+      t0 = _mm_xor_si128(t0, ini);
+      inited = 1;
+    }
+    *c2 = _mm_xor_si128(*c2, t0);
+    *c3 = _mm_xor_si128(*c3, t1);
+  } else if (len >= 16) {
+    len -= 16;
+    t0 = _mm_load_si128(reinterpret_cast<const __m128i *>(src));
+    src += 16;
+    crc32c_fold_1(c0, c1, c2, c3);
+    if (!inited) {
+      t0 = _mm_xor_si128(t0, ini);
+      inited = 1;
+    }
+    *c3 = _mm_xor_si128(*c3, t0);
+  }
+  if (len) {
+    memcpy(&part, src, len);
+    crc32c_partial_fold(len, c0, c1, c2, c3, &part);
+  }
+}
+
+/* Compute standard CRC-32C (init 0xFFFFFFFF, final ~) via PCLMUL folding.
+ * Non-static so it can be unit-tested. */
+MY_ATTRIBUTE((target("sse4.2,pclmul"), flatten))
+uint32_t crc32c_using_fold(const byte *data, size_t len) {
+  if (len < 16) {
+    uint32_t c = 0xFFFFFFFFu;
+    const uint8_t *b = reinterpret_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < len; i++) {
+      c ^= b[i];
+      for (int k = 0; k < 8; k++)
+        c = (c & 1) ? (0x82F63B78u ^ (c >> 1)) : (c >> 1);
+    }
+    return ~c;
+  }
+  __m128i c0 = _mm_setzero_si128(), c1 = _mm_setzero_si128(),
+          c2 = _mm_setzero_si128(), c3 = _mm_setzero_si128();
+  crc32c_fold_body(data, len, 0xFFFFFFFFu, &c0, &c1, &c2, &c3);
+  return ~crc32c_final_raw(c0, c1, c2, c3);
+}
+
+/* Self-check: crc32c_using_fold must match the software reference on a range
+ * of lengths before it is installed as ut_crc32. */
+static bool crc32c_using_fold_selfcheck() {
+  byte buf[2048];
+  for (size_t i = 0; i < sizeof(buf); i++)
+    buf[i] = static_cast<byte>((i * 131 + 7) & 0xff);
+  static const size_t lens[] = {16, 17, 31, 64, 100, 255, 256, 1024, 2048};
+  for (size_t L : lens) {
+    if (crc32c_using_fold(buf, L) != software::crc32(buf, L)) return false;
+  }
+  return true;
+}
+#endif /* CRC32_x86_64_DEFAULT */
+
 } /* namespace hardware */
 
 #endif /* !CRC32_DEFAULT */
@@ -827,8 +1135,22 @@ void ut_crc32_init() {
     } else {
       ut_crc32 = hardware::crc32_using_unrolled_loop_poly_mul;
     }
-    return;
   }
 #endif /* !CRC32_DEFAULT */
-  ut_crc32 = software::crc32;
+  if (ut_crc32 == nullptr) {
+    ut_crc32 = software::crc32;
+  }
+#if defined(CRC32_x86_64_DEFAULT)
+  /* Optional PCLMUL-folding backend (zlib-style, CRC-32C).  Enable with the
+   * UT_CRC32_USE_FOLD environment variable.  Self-checks against the software
+   * reference; falls back to the default selection on mismatch. */
+  if (getenv("UT_CRC32_USE_FOLD") != nullptr) {
+    if (hardware::crc32c_using_fold_selfcheck()) {
+      ut_crc32 = hardware::crc32c_using_fold;
+    } else {
+      fprintf(stderr, "ut_crc32: UT_CRC32_USE_FOLD self-check failed; "
+                      "keeping default backend\n");
+    }
+  }
+#endif /* CRC32_x86_64_DEFAULT */
 }
